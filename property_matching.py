@@ -12,50 +12,129 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from py_stringmatching import SoftTfIdf, JaroWinkler
 from termcolor import colored
 from utils import metrics
+from collections import Counter
+import numpy
+
+def extract_freq(g):
+    props = set()
+    for s, p, o in g.triples((None, RDF.type, RDF.Property)):
+        props.add(s)
+
+    ng = Graph()
+
+    pc = {}
+    for prop in props:
+
+        for s, p, o in g.triples((None, prop, None)):
+            dt = g.value(s, RDF.type)
+            if type(o) is Literal:
+                rt = URIRef(o.datatype)
+            else:
+                rt = g.value(o, RDF.type)
+                if rt is None:
+                    continue
+
+            if p not in pc:
+                pc[p] = Counter()
+
+            pc[p][(dt, rt)] += 1
+
+    for k in pc:
+        c = pc[k]
+        d, r = c.most_common(1)[0][0]
+        ng.add((k, RDFS.domain, d))
+        ng.add((k, RDFS.range, r))
+
+    ng.namespace_manager = g.namespace_manager
+    return ng
 
 
 def is_property(e, g):
-    types = list(g.objects(e, RDF.type))
-    tn = map(lambda x: get_n(x, g), types)
-    have_prop = map(lambda x: 'property' in x.lower(), tn)
-
-    return any(have_prop)
+    return (e, RDFS.domain, None) in g and (e, RDFS.range, None) in g
 
 
-def get_docs(a_entities, g1):
-    out = []
+def get_entity_label_docs(a_entities, g1):
     slist = []
     for e in a_entities:
-        ns = list(map(str.lower, tokenize(get_n(e, g1))))
+        slist.append(list(map(str.lower, tokenize(get_n(e, g1)))))
 
-        ds = []
-        if (e, RDFS.domain, None) in g1:
-            ds = list(map(str.lower, tokenize(get_n(g1.value(e, RDFS.domain), g1))))
+    return slist
 
-        rs = []
-        if (e, RDFS.range, None) in g1:
-            rs = list(map(str.lower, tokenize(get_n(g1.value(e, RDFS.range), g1))))
 
-        out.append(' '.join(ns + rs + ds))
-        slist.append(ns)
+def flat_fr_chain(e, g):
+    if g.value(e, RDF.rest) == RDF.nil:
+        return [g.value(e, RDF.first)]
+    else:
+        return [g.value(e, RDF.first)] + flat_fr_chain(g.value(e, RDF.rest), g)
 
-    return out, slist
+
+def get_cpe(e, g):
+    cp = list(set(g.predicates(e)).difference({RDF.type}))
+    return '_'.join(list(map(lambda x: get_n(x, g), cp + flat_fr_chain(g.value(e, cp[0]), g))))
+
+
+def is_joinable(e, g):
+    preds = set(g.predicates(e)).difference({RDF.type})
+    return len(preds) == 1 and OWL.unionOf in preds
+
+
+def flat_restriction(e, g):
+    nodes = []
+    for s, p, o in g.triples((e, None, None)):
+        if p == RDF.type:
+            continue
+        if type(o) is BNode:
+            nodes.extend(flat_restriction(o, g))
+        else:
+            nodes.extend([p, o])
+
+    return nodes
+
+
+def is_restriction(e, g):
+    return g.value(e, RDF.type) == OWL.Restriction
+
+
+def join_nodes(nodes, g):
+    return '_'.join(list(map(lambda x: get_n(x, g), nodes)))
 
 
 def get_gen_docs(g1):
     out = []
     for e in set(g1.subjects()):
-        ns = list(map(str.lower, tokenize(get_n(e, g1))))
+
+        if type(e) is BNode:
+            if is_joinable(e, g1):
+                label = get_cpe(e, g1)
+            elif is_restriction(e, g1):
+                label = join_nodes(flat_restriction(e, g1), g1)
+            else:
+                label = get_n(e, g1)
+
+        else:
+            label = get_n(e, g1)
+
+        ns = list(map(str.lower, tokenize(label)))
 
         if is_property(e, g1):
 
             ds = []
             if (e, RDFS.domain, None) in g1:
-                ds = list(map(str.lower, tokenize(get_n(g1.value(e, RDFS.domain), g1))))
+                domain = g1.value(e, RDFS.domain)
+                if type(domain) is BNode and is_joinable(domain, g1):
+                    dn = get_cpe(domain, g1)
+                else:
+                    dn = get_n(domain, g1)
+                ds = list(map(str.lower, tokenize(dn)))
 
             rs = []
             if (e, RDFS.range, None) in g1:
-                rs = list(map(str.lower, tokenize(get_n(g1.value(e, RDFS.range), g1))))
+                rg = g1.value(e, RDFS.range)
+                if type(rg) is BNode and is_joinable(rg, g1):
+                    rn = get_cpe(rg, g1)
+                else:
+                    rn = get_n(rg, g1)
+                rs = list(map(str.lower, tokenize(rn)))
 
             out.append(' '.join(ns + rs + ds))
         else:
@@ -89,9 +168,34 @@ def get_document_similarity(domain_a, domain_b, m):
 def get_prop(e, g, p):
     s = []
     for d in g.objects(e, p):
-        s.extend(map(str.lower, tokenize(get_n(d, g))))
+        if type(d) is BNode:
+            if is_joinable(d, g):
+                name = get_cpe(d, g)
+            elif is_restriction(d, g):
+                name = join_nodes(flat_restriction(d, g), g)
+            else:
+                name = get_n(d, g)
+        else:
+            name = get_n(d, g)
+        s.extend(map(str.lower, tokenize(name)))
 
     return s
+
+
+def build_tf_models(o1, o2):
+    a_entities = set(filter(lambda x: is_property(x, o1), o1.subjects()))
+    b_entities = set(filter(lambda x: is_property(x, o2), o2.subjects()))
+
+    slist = get_entity_label_docs(a_entities, o1) + get_entity_label_docs(b_entities, o2)
+    soft_metric = SoftTfIdf(slist, sim_func=JaroWinkler().get_raw_score, threshold=0.8)
+
+    qlist = get_gen_docs(o1) + get_gen_docs(o2)
+
+    general_metric = TfidfVectorizer()
+
+    general_metric.fit(qlist)
+
+    return soft_metric, general_metric
 
 
 class PropertyMatcher:
@@ -101,7 +205,7 @@ class PropertyMatcher:
         self.class_model = class_model
         self.sentence_model = sentence_model
 
-    def match_property(self, e1, e2, g1, g2, m, ds):
+    def match_property(self, e1, e2, g1, g2, m, ds, sim_weights=None):
 
         exact_label_a = list(map(str.lower, tokenize(get_n(e1, g1))))
 
@@ -164,293 +268,138 @@ class PropertyMatcher:
                     sim = 0
                 label_confidence = sim
 
-        return min([label_confidence, domain_confidence, range_confidence])
+        if sim_weights:
+            conf = []
+            if 0 in sim_weights:
+                conf.append(domain_confidence)
+            if 1 in sim_weights:
+                conf.append(label_confidence)
 
-    def match(self, o1, o2, th=0.65):
+            if 2 in sim_weights:
+                conf.append(range_confidence)
+        else:
+            conf = [label_confidence, domain_confidence, range_confidence]
+        return min(conf)
+
+    def match(self, base, ref, th=0.65, process_strategy=None, sim_weights=None, steps=2):
         correct = 0
         pred = 0
         total = 0
         iterations = 0
-        for r, k1, k2 in onts(o1, o2):
+        for r, k1, k2 in onts(base, ref):
 
             print('-' * 100)
             print(k1.split('/')[-1], k2.split('/')[-1])
 
+            print('Loading o1')
             o1 = Graph().parse(k1)
-            o2 = Graph().parse(k2)
+            if process_strategy is not None:
+                o1 = process_strategy(o1)
 
+            print('Loading o2')
+            o2 = Graph().parse(k2)
+            if process_strategy is not None:
+                o2 = process_strategy(o2)
             als = set(aligns(r))
 
             pa = set()
-
+            current_total = 0
             for a1, a2 in als:
 
                 if is_property(a1, o1) and is_property(a2, o2):
                     total += 1
+                    current_total += 1
                     pa.add((a1, a2))
 
-                    d1 = o1.value(a1, RDFS.domain)
-                    d2 = o2.value(a2, RDFS.domain)
-
-                    r1 = o1.value(a1, RDFS.range)
-                    r2 = o2.value(a2, RDFS.range)
-
-                    print(colored('#', 'blue'), get_n(d1, o1), get_n(a1, o1), get_n(r1, o1), colored('<>', 'green'),
-                          get_n(d2, o2), get_n(a2, o2), get_n(r2, o2))
-
+                    # d1 = o1.value(a1, RDFS.domain)
+                    # d2 = o2.value(a2, RDFS.domain)
+                    #
+                    # r1 = o1.value(a1, RDFS.range)
+                    # r2 = o2.value(a2, RDFS.range)
+                    #
+                    # print(colored('#', 'blue'), get_n(d1, o1), get_n(a1, o1), get_n(r1, o1), colored('<>', 'green'),
+                    #       get_n(d2, o2), get_n(a2, o2), get_n(r2, o2))
+            print(current_total)
             a_entities = set(filter(lambda x: is_property(x, o1), o1.subjects()))
             b_entities = set(filter(lambda x: is_property(x, o2), o2.subjects()))
-
-            l1, s1 = get_docs(a_entities, o1)
-            l2, s2 = get_docs(b_entities, o2)
-
-            qlist = l1 + l2
-            slist = s1 + s2
-
-            prop_metric = TfidfVectorizer()
-
-            prop_metric.fit(qlist)
-
-            qlist = get_gen_docs(o1) + get_gen_docs(o2)
-
-            general_metric = TfidfVectorizer()
-
-            general_metric.fit(qlist)
-            soft_metric = SoftTfIdf(slist, sim_func=JaroWinkler().get_raw_score, threshold=0.8)
-            p = set()
-
-            ds = {}
-
-            pm = {}
-
-            oi = 0
-
-            for step in range(2):
-
-                for e1 in set(o1.subjects()):
-                    if not is_property(e1, o1):
-                        continue
-                    for e2 in set(o2.subjects()):
-                        if not is_property(e2, o2):
-                            continue
-
-                        sim = self.match_property(e1, e2, o1, o2, (soft_metric, general_metric), ds)
-                        iterations += 1
-                        oi += 1
-                        if sim > th:
-                            if e1 in pm:
-                                if pm[e1][1] >= sim:
-                                    continue
-                                elif pm[e1][1] < sim:
-                                    p.discard((e1, pm[e1][0]))
-                                    pm.pop(pm[e1][0])
-                                    pm.pop(e1)
-
-                            if e2 in pm:
-                                if pm[e2][1] >= sim:
-                                    continue
-                                elif pm[e2][1] < sim:
-                                    p.discard((pm[e2][0], e2))
-                                    pm.pop(pm[e2][0])
-                                    pm.pop(e2)
-
-                            d1 = o1.value(e1, RDFS.domain)
-                            d2 = o2.value(e2, RDFS.domain)
-                            ds[(d1, d2)] = 0.66
-                            p.add((e1, e2))
-                            pm[e1] = (e2, sim)
-                            pm[e2] = (e1, sim)
-                            if (e1, OWL.inverseOf, None) in o1 and (e2, OWL.inverseOf, None) in o2:
-                                d1 = o1.value(o1.value(e1, OWL.inverseOf), RDFS.domain)
-                                d2 = o2.value(o2.value(e2, OWL.inverseOf), RDFS.domain)
-
-                                ds[(d1, d2)] = 0.66
-                                iv1, iv2 = o1.value(e1, OWL.inverseOf), o2.value(e2, OWL.inverseOf)
-                                p.add((iv1, iv2))
-                                pm[iv1] = (iv2, sim)
-                                pm[iv2] = (iv1, sim)
-
+            p, it = self.match_ontologies(o1, o2, th, sim_weights=sim_weights, steps=steps)
+            iterations += it
+            oi = it
+            current_pred = len(p)
+            current_correct = len(pa.intersection(p))
             pred += len(p)
             correct += len(pa.intersection(p))
 
-            for a1, a2 in pa.intersection(p):
-                print(colored('✓', 'green'), get_n(a1, o1), get_n(a2, o2))
+            # for a1, a2 in pa.intersection(p):
+            #     print(colored('✓', 'green'), get_n(a1, o1), get_n(a2, o2))
+            #
+            # for a1, a2 in p.difference(pa):
+            #     d1 = o1.value(a1, RDFS.domain)
+            #     d2 = o2.value(a2, RDFS.domain)
+            #
+            #     r1 = o1.value(a1, RDFS.range)
+            #     r2 = o2.value(a2, RDFS.range)
+            #     print(colored('X', 'red'), get_n(d1, o1), get_n(a1, o1), get_n(r1, o1), colored('<>', 'green'),
+            #           get_n(d2, o2), get_n(a2, o2), get_n(r2, o2))
 
-            for a1, a2 in p.difference(pa):
-                d1 = o1.value(a1, RDFS.domain)
-                d2 = o2.value(a2, RDFS.domain)
-
-                r1 = o1.value(a1, RDFS.range)
-                r2 = o2.value(a2, RDFS.range)
-                print(colored('X', 'red'), get_n(d1, o1), get_n(a1, o1), get_n(r1, o1), colored('<>', 'green'),
-                      get_n(d2, o2), get_n(a2, o2), get_n(r2, o2))
-
-            print('ontology iterations:', oi)
+            print(
+                f'ontology iterations: {oi}, {metrics(current_correct, current_pred, current_total)}, aligns: {current_total}, po1: {len(a_entities)}, po2: {len(b_entities)}')
         print(f'iterations: {iterations}, {metrics(correct, pred, total)}')
         return metrics(correct, pred, total)
 
+    def match_ontologies(self, o1, o2, th, sim_weights=None, steps=2):
 
+        soft_metric, general_metric = build_tf_models(o1, o2)
+        p = set()
 
-    def match_with_model_filter(self, o1, o2, tokenizer, model):
-        correct = 0
-        pred = 0
-        total = 0
+        ds = {}
+
+        pm = {}
+
         iterations = 0
-        for r, k1, k2 in onts(o1, o2):  # [(rp, o1p, o2p)]:
-
-            print('-' * 100)
-            print(k1.split('/')[-1], k2.split('/')[-1])
-
-            o1 = Graph().parse(k1)
-            o2 = Graph().parse(k2)
-
-            als = set(aligns(r))
-
-            pa = set()
-
-            for a1, a2 in als:
-
-                if is_property(a1, o1) and is_property(a2, o2):
-                    total += 1
-                    pa.add((a1, a2))
-
-                    d1 = o1.value(a1, RDFS.domain)
-                    d2 = o2.value(a2, RDFS.domain)
-
-                    r1 = o1.value(a1, RDFS.range)
-                    r2 = o2.value(a2, RDFS.range)
-
-                    print(colored('#', 'blue'), get_n(d1, o1), get_n(a1, o1), get_n(r1, o1), colored('<>', 'green'),
-                          get_n(d2, o2), get_n(a2, o2), get_n(r2, o2))
-
-            aEntities = set(filter(lambda x: is_property(x, o1), o1.subjects()))
-            bEntities = set(filter(lambda x: is_property(x, o2), o2.subjects()))
-
-            l1, s1 = get_docs(aEntities, o1)
-            l2, s2 = get_docs(bEntities, o2)
-
-            qlist = l1 + l2
-            slist = s1 + s2
-
-            propMetric = TfidfVectorizer()
-
-            propMetric.fit(qlist)
-
-            qlist = get_gen_docs(o1) + get_gen_docs(o2)
-
-            generalMetric = TfidfVectorizer()
-
-            generalMetric.fit(qlist)
-            softMetric = SoftTfIdf(slist, sim_func=JaroWinkler().get_raw_score, threshold=0.8)
-            p = set()
-
-            ds = {}
-
-            pm = {}
-
-            p1 = []
-
+        for step in range(steps):
             for e1 in set(o1.subjects()):
-                if not is_property(e1, o1) or (e1, RDFS.domain, None) not in o1 or type(
-                        o1.value(e1, RDFS.domain)) is BNode:
+                if not is_property(e1, o1):
                     continue
+                for e2 in set(o2.subjects()):
+                    if not is_property(e2, o2):
+                        continue
 
-                p1.append(e1)
-
-            p2 = []
-
-            for e2 in set(o2.subjects()):
-                if not is_property(e2, o2) or (e2, RDFS.domain, None) not in o2 or type(
-                        o2.value(e2, RDFS.domain)) is BNode:
-                    continue
-
-                p2.append(e2)
-
-            p1d = [' '.join(map(str.lower, tokenize(get_n(o1.value(x, RDFS.domain), o1)))) for x in p1]
-            p2d = [' '.join(map(str.lower, tokenize(get_n(o2.value(x, RDFS.domain), o2)))) for x in p2]
-
-            tk = tokenizer(p1d, return_tensors='pt', padding=True)
-
-            idx = tk['input_ids']
-            atn = tk['attention_mask']
-
-            with torch.no_grad():
-                out1 = model(idx.cuda(0), atn.cuda(0)).exp().cpu()
-
-            tk = tokenizer(p2d, return_tensors='pt', padding=True)
-
-            idx = tk['input_ids']
-            atn = tk['attention_mask']
-
-            with torch.no_grad():
-                out2 = model(idx.cuda(0), atn.cuda(0)).exp().cpu()
-
-            cl1 = out1.argmax(dim=1)
-            cl2 = out2.argmax(dim=1)
-            sim = cl1.unsqueeze(1) == cl2.unsqueeze(0)
-
-
-
-            nz = list(map(lambda x: (p1[x[0].item()], p2[x[1].item()]), sim.nonzero()))
-            oi = 0
-            for step in range(2):
-
-                for e1, e2 in nz:
-
-
-                    sim = self.match_property(e1, e2, o1, o2, (softMetric, generalMetric), ds)
+                    sim = self.match_property(e1, e2, o1, o2, (soft_metric, general_metric), ds, sim_weights=sim_weights)
                     iterations += 1
-                    oi += 1
-                    if sim > 0.65:
+                    if sim <= th:
+                        continue
 
-                        if e1 in pm:
-                            if pm[e1][1] >= sim:
-                                continue
-                            elif pm[e1][1] < sim:
-                                p.discard((e1, pm[e1][0]))
-                                pm.pop(pm[e1][0])
-                                pm.pop(e1)
+                    if e1 in pm:
+                        if pm[e1][1] >= sim:
+                            continue
+                        elif pm[e1][1] < sim:
+                            p.discard((e1, pm[e1][0]))
+                            pm.pop(pm[e1][0])
+                            pm.pop(e1)
 
-                        if e2 in pm:
-                            if pm[e2][1] >= sim:
-                                continue
-                            elif pm[e2][1] < sim:
-                                p.discard((pm[e2][0], e2))
-                                pm.pop(pm[e2][0])
-                                pm.pop(e2)
+                    if e2 in pm:
+                        if pm[e2][1] >= sim:
+                            continue
+                        elif pm[e2][1] < sim:
+                            p.discard((pm[e2][0], e2))
+                            pm.pop(pm[e2][0])
+                            pm.pop(e2)
 
-                        d1 = o1.value(e1, RDFS.domain)
-                        d2 = o2.value(e2, RDFS.domain)
+                    d1 = o1.value(e1, RDFS.domain)
+                    d2 = o2.value(e2, RDFS.domain)
+                    ds[(d1, d2)] = 0.66
+                    p.add((e1, e2))
+                    pm[e1] = (e2, sim)
+                    pm[e2] = (e1, sim)
+                    if (e1, OWL.inverseOf, None) in o1 and (e2, OWL.inverseOf, None) in o2:
+                        d1 = o1.value(o1.value(e1, OWL.inverseOf), RDFS.domain)
+                        d2 = o2.value(o2.value(e2, OWL.inverseOf), RDFS.domain)
 
                         ds[(d1, d2)] = 0.66
-                        p.add((e1, e2))
-                        pm[e1] = (e2, sim)
-                        pm[e2] = (e1, sim)
+                        iv1, iv2 = o1.value(e1, OWL.inverseOf), o2.value(e2, OWL.inverseOf)
+                        p.add((iv1, iv2))
+                        pm[iv1] = (iv2, sim)
+                        pm[iv2] = (iv1, sim)
 
-                        if (e1, OWL.inverseOf, None) in o1 and (e2, OWL.inverseOf, None) in o2:
-                            d1 = o1.value(o1.value(e1, OWL.inverseOf), RDFS.domain)
-                            d2 = o2.value(o2.value(e2, OWL.inverseOf), RDFS.domain)
-
-                            ds[(d1, d2)] = 0.66
-                            iv1, iv2 = o1.value(e1, OWL.inverseOf), o2.value(e2, OWL.inverseOf)
-                            p.add((iv1, iv2))
-                            pm[iv1] = (iv2, sim)
-                            pm[iv2] = (iv1, sim)
-
-            pred += len(p)
-            correct += len(pa.intersection(p))
-
-            for a1, a2 in pa.intersection(p):
-                print(colored('✓', 'green'), get_n(a1, o1), get_n(a2, o2))
-
-            for a1, a2 in p.difference(pa):
-                d1 = o1.value(a1, RDFS.domain)
-                d2 = o2.value(a2, RDFS.domain)
-
-                r1 = o1.value(a1, RDFS.range)
-                r2 = o2.value(a2, RDFS.range)
-                print(colored('X', 'red'), get_n(d1, o1), get_n(a1, o1), get_n(r1, o1), colored('<>', 'green'),
-                      get_n(d2, o2), get_n(a2, o2), get_n(r2, o2))
-
-            print('ontology iterations:', oi)
-        print(f'iterations: {iterations}, {metrics(correct, pred, total)}')
+        return p, iterations
