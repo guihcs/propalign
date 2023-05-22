@@ -1,21 +1,41 @@
 import numpy as np
 from nlp import filter_jj, get_core_concept
-
-import torch
+from transformers import AutoTokenizer
 import torch.nn as nn
 from om.match import onts, aligns
 from om.ont import get_n, tokenize
 from rdflib import Graph
-from rdflib.namespace import RDF, RDFS, OWL
+from rdflib.namespace import RDF, RDFS, OWL, DCTERMS, SKOS
 from rdflib.term import Literal, BNode, URIRef
 from sklearn.feature_extraction.text import TfidfVectorizer
 from py_stringmatching import SoftTfIdf, JaroWinkler
-from termcolor import colored
 from utils import metrics
 from collections import Counter
-import numpy
+from tqdm.auto import tqdm
+import math
 
-def extract_freq(g):
+def get_type_h(e, g, ml=1):
+    if type(e) is Literal:
+        return [e.datatype]
+
+    tp = g.value(e, DCTERMS.subject)
+
+    if tp is None:
+        return [e]
+
+    h = [tp]
+
+    for _ in range(ml):
+        if g.value(tp, SKOS.broader) is None:
+            break
+
+        tp = g.value(tp, SKOS.broader)
+        h.append(tp)
+
+    return h
+
+
+def most_common_dr_hist(g, ml=1, mh=5):
     props = set()
     for s, p, o in g.triples((None, RDF.type, RDF.Property)):
         props.add(s)
@@ -26,22 +46,99 @@ def extract_freq(g):
     for prop in props:
 
         for s, p, o in g.triples((None, prop, None)):
-            dt = g.value(s, RDF.type)
-            if type(o) is Literal:
-                rt = URIRef(o.datatype)
-            else:
-                rt = g.value(o, RDF.type)
-                if rt is None:
-                    continue
+            st = get_type_h(s, g, ml=ml)
+            ot = get_type_h(o, g, ml=ml)
+
+            if p not in pc:
+                pc[p] = {'domain': Counter(), 'range': Counter()}
+
+            for s in st:
+                pc[p]['domain'][s] += 1
+
+            for o in ot:
+                pc[p]['range'][o] += 1
+
+    for k in pc:
+        c = pc[k]
+        d = c['domain'].most_common(mh)
+        r = c['range'].most_common(mh)
+
+        jd = '_'.join([x[0].split('/')[-1].split('#')[-1].split(':')[-1] for x in d])
+        jr = '_'.join([x[0].split('/')[-1].split('#')[-1].split(':')[-1] for x in r])
+
+        ng.add((k, RDFS.domain, URIRef(jd)))
+        ng.add((k, RDFS.range, URIRef(jr)))
+
+    ng.namespace_manager = g.namespace_manager
+    return ng
+
+
+def get_type(e, g):
+    if type(e) is Literal:
+        return e.datatype
+
+    tp = g.value(e, DCTERMS.subject)
+
+    if tp is None:
+        return e
+
+    return tp
+
+
+def most_common_pair(g):
+    props = set()
+    for s, p, o in g.triples((None, RDF.type, RDF.Property)):
+        props.add(s)
+
+    ng = Graph()
+
+    pc = {}
+    for prop in props:
+
+        for s, p, o in g.triples((None, prop, None)):
+            st = get_type(s, g)
+            ot = get_type(o, g)
 
             if p not in pc:
                 pc[p] = Counter()
 
-            pc[p][(dt, rt)] += 1
+            pc[p][(st, ot)] += 1
 
     for k in pc:
         c = pc[k]
-        d, r = c.most_common(1)[0][0]
+        d, r = c.most_common()[0][0]
+        ng.add((k, RDFS.domain, d))
+        ng.add((k, RDFS.range, r))
+
+    ng.namespace_manager = g.namespace_manager
+    return ng
+
+
+def most_common_dr(g):
+    props = set()
+    for s, p, o in g.triples((None, RDF.type, RDF.Property)):
+        props.add(s)
+
+    ng = Graph()
+
+    pc = {}
+    for prop in props:
+
+        for s, p, o in g.triples((None, prop, None)):
+            st = get_type(s, g)
+            ot = get_type(o, g)
+
+            if p not in pc:
+                pc[p] = {'domain': Counter(), 'range': Counter()}
+
+            pc[p]['domain'][st] += 1
+            pc[p]['range'][ot] += 1
+
+    for k in pc:
+        c = pc[k]
+        d = c['domain'].most_common()[0][0]
+        r = c['range'].most_common()[0][0]
+
         ng.add((k, RDFS.domain, d))
         ng.add((k, RDFS.range, r))
 
@@ -70,7 +167,8 @@ def flat_fr_chain(e, g):
 
 def get_cpe(e, g):
     cp = list(set(g.predicates(e)).difference({RDF.type}))
-    return '_'.join(list(map(lambda x: get_n(x, g), cp + flat_fr_chain(g.value(e, cp[0]), g))))
+    objs = list(map(lambda x: get_n(x, g), cp + flat_fr_chain(g.value(e, cp[0]), g)))
+    return '_'.join(objs), len(objs)
 
 
 def is_joinable(e, g):
@@ -105,7 +203,7 @@ def get_gen_docs(g1):
 
         if type(e) is BNode:
             if is_joinable(e, g1):
-                label = get_cpe(e, g1)
+                label, _ = get_cpe(e, g1)
             elif is_restriction(e, g1):
                 label = join_nodes(flat_restriction(e, g1), g1)
             else:
@@ -122,7 +220,7 @@ def get_gen_docs(g1):
             if (e, RDFS.domain, None) in g1:
                 domain = g1.value(e, RDFS.domain)
                 if type(domain) is BNode and is_joinable(domain, g1):
-                    dn = get_cpe(domain, g1)
+                    dn, _ = get_cpe(domain, g1)
                 else:
                     dn = get_n(domain, g1)
                 ds = list(map(str.lower, tokenize(dn)))
@@ -131,7 +229,7 @@ def get_gen_docs(g1):
             if (e, RDFS.range, None) in g1:
                 rg = g1.value(e, RDFS.range)
                 if type(rg) is BNode and is_joinable(rg, g1):
-                    rn = get_cpe(rg, g1)
+                    rn, _ = get_cpe(rg, g1)
                 else:
                     rn = get_n(rg, g1)
                 rs = list(map(str.lower, tokenize(rn)))
@@ -167,10 +265,13 @@ def get_document_similarity(domain_a, domain_b, m):
 
 def get_prop(e, g, p):
     s = []
-    for d in g.objects(e, p):
+    objs = list(g.objects(e, p))
+    objc = len(objs)
+    for d in objs:
         if type(d) is BNode:
             if is_joinable(d, g):
-                name = get_cpe(d, g)
+                name, oc = get_cpe(d, g)
+                objc += oc - 1
             elif is_restriction(d, g):
                 name = join_nodes(flat_restriction(d, g), g)
             else:
@@ -179,7 +280,10 @@ def get_prop(e, g, p):
             name = get_n(d, g)
         s.extend(map(str.lower, tokenize(name)))
 
-    return s
+    return s, objc
+
+
+
 
 
 def build_tf_models(o1, o2):
@@ -205,12 +309,12 @@ class PropertyMatcher:
         self.class_model = class_model
         self.sentence_model = sentence_model
 
-    def match_property(self, e1, e2, g1, g2, m, ds, sim_weights=None):
+    def match_property(self, e1, e2, g1, g2, m, ds, sim_weights=None, disable_dr=False):
 
         exact_label_a = list(map(str.lower, tokenize(get_n(e1, g1))))
 
-        domain_a = get_prop(e1, g1, RDFS.domain)
-        range_a = get_prop(e1, g1, RDFS.range)
+        domain_a, dca = get_prop(e1, g1, RDFS.domain)
+        range_a, rca = get_prop(e1, g1, RDFS.range)
 
         if len(range_a) == 1 and exact_label_a[-1] == range_a[0]:
             exact_label_a.pop(-1)
@@ -219,8 +323,8 @@ class PropertyMatcher:
 
         exact_label_b = list(map(str.lower, tokenize(get_n(e2, g2))))
 
-        domain_b = get_prop(e2, g2, RDFS.domain)
-        range_b = get_prop(e2, g2, RDFS.range)
+        domain_b, dcb = get_prop(e2, g2, RDFS.domain)
+        range_b, rcb = get_prop(e2, g2, RDFS.range)
 
         if len(range_b) == 1 and exact_label_b[-1] == range_b[0]:
             exact_label_b.pop(-1)
@@ -230,7 +334,10 @@ class PropertyMatcher:
         range_a = filter_jj(range_a)
         range_b = filter_jj(range_b)
 
-        if len(string_a) <= 0 or len(string_b) <= 0:
+        if exact_label_a == exact_label_b:
+            label_conf_a = 1
+            label_conf_b = 1
+        elif len(string_a) <= 0 or len(string_b) <= 0:
 
             label_conf_a = 0
             label_conf_b = 0
@@ -257,6 +364,11 @@ class PropertyMatcher:
         if rsp in ds:
             range_confidence += ds[rsp]
 
+        if disable_dr:
+            domain_confidence = 0
+            range_confidence = 0
+            sim_weights = [1]
+
         if domain_confidence > 0.95 and range_confidence > 0.95 and label_confidence < 0.1:
             if len(string_a) <= 1 and len(string_b) <= 1:
                 sr = [' '.join(domain_a + list(map(str.lower, tokenize(get_n(e1, g1)))) + range_a)]
@@ -267,6 +379,7 @@ class PropertyMatcher:
                 if sim < 0.8:
                     sim = 0
                 label_confidence = sim
+
 
         if sim_weights:
             conf = []
@@ -281,12 +394,17 @@ class PropertyMatcher:
             conf = [label_confidence, domain_confidence, range_confidence]
         return min(conf)
 
-    def match(self, base, ref, th=0.65, process_strategy=None, sim_weights=None, steps=2):
+    def match(self, base, ref, th=0.65, process_strategy=None, sim_weights=None, steps=2, disable_dr=False, tr=None):
         correct = 0
         pred = 0
         total = 0
         iterations = 0
-        for r, k1, k2 in onts(base, ref):
+
+        if tr is not None:
+            trm = [[0, 0] for _ in tr]
+
+
+        for r, k1, k2 in tqdm(list(onts(base, ref))):
 
             print('-' * 100)
             print(k1.split('/')[-1], k2.split('/')[-1])
@@ -322,13 +440,24 @@ class PropertyMatcher:
             print(current_total)
             a_entities = set(filter(lambda x: is_property(x, o1), o1.subjects()))
             b_entities = set(filter(lambda x: is_property(x, o2), o2.subjects()))
-            p, it = self.match_ontologies(o1, o2, th, sim_weights=sim_weights, steps=steps)
+            p, it = self.match_ontologies(o1, o2, th, sim_weights=sim_weights, steps=steps, disable_dr=disable_dr)
             iterations += it
             oi = it
             current_pred = len(p)
-            current_correct = len(pa.intersection(p))
+            current_correct = len(pa.intersection(set(p.keys())))
             pred += len(p)
-            correct += len(pa.intersection(p))
+            correct += len(pa.intersection(set(p.keys())))
+
+            if tr is not None:
+                for i, t in enumerate(tr):
+                    cp = set()
+                    for pair, sim in p.items():
+                        if sim >= t:
+                            cp.add(pair)
+
+                    trm[i][0] += len(pa.intersection(cp))
+                    trm[i][1] += len(cp)
+                    print(f'ontology iterations: {oi}, {metrics(len(pa.intersection(cp)), len(cp), current_total)}, aligns: {current_total}, po1: {len(a_entities)}, po2: {len(b_entities)}')
 
             # for a1, a2 in pa.intersection(p):
             #     print(colored('✓', 'green'), get_n(a1, o1), get_n(a2, o2))
@@ -342,15 +471,22 @@ class PropertyMatcher:
             #     print(colored('X', 'red'), get_n(d1, o1), get_n(a1, o1), get_n(r1, o1), colored('<>', 'green'),
             #           get_n(d2, o2), get_n(a2, o2), get_n(r2, o2))
 
-            print(
-                f'ontology iterations: {oi}, {metrics(current_correct, current_pred, current_total)}, aligns: {current_total}, po1: {len(a_entities)}, po2: {len(b_entities)}')
+            # print(
+            #     f'ontology iterations: {oi}, {metrics(current_correct, current_pred, current_total)}, aligns: {current_total}, po1: {len(a_entities)}, po2: {len(b_entities)}')
         print(f'iterations: {iterations}, {metrics(correct, pred, total)}')
+        if tr is not None:
+            res = []
+            for q, w in trm:
+                res.append(metrics(q, w, total))
+
+            return res
+
         return metrics(correct, pred, total)
 
-    def match_ontologies(self, o1, o2, th, sim_weights=None, steps=2):
+    def match_ontologies(self, o1, o2, th, sim_weights=None, steps=2, disable_dr=False):
 
         soft_metric, general_metric = build_tf_models(o1, o2)
-        p = set()
+        p = {}
 
         ds = {}
 
@@ -365,7 +501,9 @@ class PropertyMatcher:
                     if not is_property(e2, o2):
                         continue
 
-                    sim = self.match_property(e1, e2, o1, o2, (soft_metric, general_metric), ds, sim_weights=sim_weights)
+                    sim = self.match_property(e1, e2, o1, o2, (soft_metric, general_metric), ds,
+                                              sim_weights=sim_weights, disable_dr=disable_dr)
+
                     iterations += 1
                     if sim <= th:
                         continue
@@ -374,7 +512,7 @@ class PropertyMatcher:
                         if pm[e1][1] >= sim:
                             continue
                         elif pm[e1][1] < sim:
-                            p.discard((e1, pm[e1][0]))
+                            p.pop((e1, pm[e1][0]))
                             pm.pop(pm[e1][0])
                             pm.pop(e1)
 
@@ -382,14 +520,14 @@ class PropertyMatcher:
                         if pm[e2][1] >= sim:
                             continue
                         elif pm[e2][1] < sim:
-                            p.discard((pm[e2][0], e2))
+                            p.pop((pm[e2][0], e2))
                             pm.pop(pm[e2][0])
                             pm.pop(e2)
 
                     d1 = o1.value(e1, RDFS.domain)
                     d2 = o2.value(e2, RDFS.domain)
                     ds[(d1, d2)] = 0.66
-                    p.add((e1, e2))
+                    p[(e1, e2)] = sim
                     pm[e1] = (e2, sim)
                     pm[e2] = (e1, sim)
                     if (e1, OWL.inverseOf, None) in o1 and (e2, OWL.inverseOf, None) in o2:
@@ -398,8 +536,10 @@ class PropertyMatcher:
 
                         ds[(d1, d2)] = 0.66
                         iv1, iv2 = o1.value(e1, OWL.inverseOf), o2.value(e2, OWL.inverseOf)
-                        p.add((iv1, iv2))
+                        p[(iv1, iv2)] = sim
                         pm[iv1] = (iv2, sim)
                         pm[iv2] = (iv1, sim)
 
+
         return p, iterations
+
