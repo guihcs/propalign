@@ -14,6 +14,7 @@ from collections import Counter
 from tqdm.auto import tqdm
 import math
 
+
 def get_type_h(e, g, ml=1):
     if type(e) is Literal:
         return [e.datatype]
@@ -283,9 +284,6 @@ def get_prop(e, g, p):
     return s, objc
 
 
-
-
-
 def build_tf_models(o1, o2):
     a_entities = set(filter(lambda x: is_property(x, o1), o1.subjects()))
     b_entities = set(filter(lambda x: is_property(x, o2), o2.subjects()))
@@ -380,7 +378,6 @@ class PropertyMatcher:
                     sim = 0
                 label_confidence = sim
 
-
         if sim_weights:
             conf = []
             if 0 in sim_weights:
@@ -402,7 +399,6 @@ class PropertyMatcher:
 
         if tr is not None:
             trm = [[0, 0] for _ in tr]
-
 
         for r, k1, k2 in tqdm(list(onts(base, ref))):
 
@@ -457,7 +453,8 @@ class PropertyMatcher:
 
                     trm[i][0] += len(pa.intersection(cp))
                     trm[i][1] += len(cp)
-                    print(f'ontology iterations: {oi}, {metrics(len(pa.intersection(cp)), len(cp), current_total)}, aligns: {current_total}, po1: {len(a_entities)}, po2: {len(b_entities)}')
+                    print(
+                        f'ontology iterations: {oi}, {metrics(len(pa.intersection(cp)), len(cp), current_total)}, aligns: {current_total}, po1: {len(a_entities)}, po2: {len(b_entities)}')
 
             # for a1, a2 in pa.intersection(p):
             #     print(colored('✓', 'green'), get_n(a1, o1), get_n(a2, o2))
@@ -471,8 +468,9 @@ class PropertyMatcher:
             #     print(colored('X', 'red'), get_n(d1, o1), get_n(a1, o1), get_n(r1, o1), colored('<>', 'green'),
             #           get_n(d2, o2), get_n(a2, o2), get_n(r2, o2))
 
-            # print(
-            #     f'ontology iterations: {oi}, {metrics(current_correct, current_pred, current_total)}, aligns: {current_total}, po1: {len(a_entities)}, po2: {len(b_entities)}')
+            print(
+                f'ontology iterations: {oi}, {metrics(current_correct, current_pred, current_total)}, aligns: {current_total}, po1: {len(a_entities)}, po2: {len(b_entities)}')
+
         print(f'iterations: {iterations}, {metrics(correct, pred, total)}')
         if tr is not None:
             res = []
@@ -540,6 +538,4 @@ class PropertyMatcher:
                         pm[iv1] = (iv2, sim)
                         pm[iv2] = (iv1, sim)
 
-
         return p, iterations
-
