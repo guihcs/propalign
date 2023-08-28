@@ -29,7 +29,6 @@ class Finbank:
         self.ep = ep
 
         if not os.path.exists('./fin_cache'):
-            print('Embeddings cache not found. Building...')
             os.mkdir('./fin_cache')
 
             with open('./fin_cache/fbk.txt', 'w') as fbk:

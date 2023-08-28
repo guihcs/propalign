@@ -1,28 +1,37 @@
+import sys
+
 from sentence_transformers import SentenceTransformer
 from models import Finbank
-import random
-import torch
-import numpy as np
 from property_matching import PropertyMatcher
-from tqdm.auto import tqdm
-from property_matching import most_common_pair
-import matplotlib.pyplot as plt
+import os
+import requests
 import argparse
 import rdflib
 import tempfile
 from urllib import parse, request
 from om.ont import get_namespace
+import json
+from typing import Union
+import re
 
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Form, Response, UploadFile, File
+from fastapi.responses import PlainTextResponse, Response
+from typing_extensions import Annotated
 
-def parse_arguments():
-    arg_parser = argparse.ArgumentParser(description='LD similarity.')
+app = FastAPI()
 
-    arg_parser.add_argument('source', help='Source ontology path.')
-    arg_parser.add_argument('target', help='Target ontology path.')
-    arg_parser.add_argument('--output', dest='output', default='./output', help='Folder to save the results.')
-    arg_parser.add_argument('--format', dest='format', default='align', choices=['align', 'sssom'], help='Output format.')
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins='*',
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    return arg_parser.parse_args()
+wm = Finbank('./fin.bin')
+model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+property_matcher = PropertyMatcher(wm, model)
 
 
 def toAlignFormat(aligns, onto1, onto2, location1, location2):
@@ -62,6 +71,7 @@ def toAlignFormat(aligns, onto1, onto2, location1, location2):
 
     return '\n'.join(data)
 
+
 def ssom(aligns):
     lines = ['subject_id\tpredicate_id\tobject_id\tmapping_justification\tconfidence']
     for (entity1, entity2), confidence in aligns.items():
@@ -69,30 +79,45 @@ def ssom(aligns):
 
     return "\n".join(lines)
 
-if __name__ == '__main__':
-    args = parse_arguments()
-    wm = Finbank('/home/guilherme/Documents/kg/fin.bin')
-    model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-    property_matcher = PropertyMatcher(wm, model)
 
-    o1 = rdflib.Graph().parse(args.source)
-    o2 = rdflib.Graph().parse(args.target)
+@app.post('/match')
+async def match(source: Union[str, UploadFile] = Form(...),
+                target: Union[str, UploadFile] = Form(...),
+                inputAlignment: Annotated[Union[str, None], Form()] = None,
+                parameters: Annotated[Union[str, None], Form()] = None):
+    outputFile = type(source) != str
 
-    p, it = property_matcher.match_ontologies(o1, o2, 0.65)
+    if type(source) == str:
+        o1 = rdflib.Graph().parse(source)
+        o2 = rdflib.Graph().parse(target)
+    else:
 
+        o1 = rdflib.Graph().parse(source.file, format=re.split(r'\W', source.content_type)[-1])
+        o2 = rdflib.Graph().parse(target.file, format=re.split(r'\W', target.content_type)[-1])
 
+    params = {}
 
-    # Parser
+    if parameters is not None:
+        with open(parameters) as f:
+            params = json.load(f)
 
+    p, it = property_matcher.match_ontologies(o1, o2, 0.65,
+                                              sim_weights=params['sim_weights'] if 'sim_weights' in params else None)
 
-    if args.format == 'sssom':
+    if 'format' in params and params['format'] == 'sssom':
         result = ssom(p)
         suffix = '.tsv'
     else:
-        result = toAlignFormat(p, get_namespace(o1), get_namespace(o2), args.source, args.target)
+        if outputFile:
+            source = source.filename
+            target = target.filename
+        result = toAlignFormat(p, get_namespace(o1), get_namespace(o2), source, target)
         suffix = '.rdf'
 
-    with tempfile.NamedTemporaryFile('w', prefix='alignment_', suffix=suffix, delete=False) as out_file:
-        out_file.write(result)
+    if outputFile:
+        return Response(result, media_type='application/rdf+xml')
+    else:
+        with tempfile.NamedTemporaryFile('w', prefix='alignment_', suffix=suffix, delete=False) as out_file:
+            out_file.write(result)
 
-        print(parse.urljoin("file:", request.pathname2url(out_file.name)))
+        return PlainTextResponse(out_file.name)

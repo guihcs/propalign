@@ -1,5 +1,6 @@
 import nltk
 
+nltk.download('averaged_perceptron_tagger')
 
 def get_core_concept(e1):
     t1 = nltk.pos_tag(e1)

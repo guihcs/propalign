@@ -12,3 +12,6 @@ termcolor
 py-stringmatching
 scikit-learn
 jupyter
+fastapi
+python-multipart
+uvicorn[standard]

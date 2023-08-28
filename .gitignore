@@ -3,3 +3,5 @@ fin_cache
 .idea
 __pycache__
 .ipynb_checkpoints
+fin.bin
+propmatch.tar.gz
