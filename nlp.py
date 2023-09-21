@@ -2,44 +2,36 @@ import nltk
 
 nltk.download('averaged_perceptron_tagger')
 
-def get_core_concept(e1):
-    t1 = nltk.pos_tag(e1)
-    v1 = []
-    sn = False
-    for t in t1:
-        if 'V' in t[1] and len(t[0]) > 4:
 
-            v1.append(t[0])
+def get_core_concept(entity):
+    """
+    Get the core concept of an entity. The core concept is the first verb with length > 4 or the first noun with its
+    adjectives.
+    :param entity: RDFLib entity
+    :return: list of words
+    """
+    tags = nltk.pos_tag(entity)
+    core_concept = []
+    no_name = False
+    for (word, tag) in tags:
+        if 'V' in tag and len(word) > 4:
+            core_concept.append(word)
             break
 
-        if 'N' in t[1] or 'J' in t[1] and not sn:
-            if 'IN' in t[1]:
-                sn = True
+        if 'N' in tag or 'J' in tag and not no_name:
+            if 'IN' in tag:
+                no_name = True
             else:
-                v1.append(t[0])
+                core_concept.append(word)
 
-    return v1
-
-
-def get_core_tagged(e1):
-    t1 = nltk.pos_tag(e1)
-    v1 = []
-    sn = False
-    for t in t1:
-        if 'V' in t[1] and len(t[0]) > 4:
-
-            v1.append(t)
-            break
-
-        if 'N' in t[1] or 'J' in t[1] and not sn:
-            if 'IN' in t[1]:
-                sn = True
-            else:
-                v1.append(t)
-
-    return v1
+    return core_concept
 
 
-def filter_jj(words):
+def filter_adjectives(words):
+    """
+    Filter adjectives from a list of words.
+    :param words: list of words
+    :return: list of words without adjectives
+    """
     tags = nltk.pos_tag(words)
-    return list(map(lambda x: x[0], filter(lambda x: x[1][0] == 'N', tags)))
+    return list(map(lambda word: word[0], filter(lambda word: word[1][0] == 'N', tags)))
